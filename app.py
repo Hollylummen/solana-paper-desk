@@ -1,14 +1,13 @@
+import os
 import streamlit as st
 import pandas as pd
+import psycopg2
 from solana_desk.engine import DeskEngine
 from solana_desk.market_data import fetch_live_candidates, demo_candidates
 
 st.set_page_config(page_title="Solana Paper Desk", page_icon="📊", layout="wide")
 st.title("📊 Solana Memecoin Paper Desk")
 st.caption("Paper trading only • No wallet connection • No live transactions")
-
-import os
-import psycopg2
 
 
 def read_bot_state():
@@ -28,6 +27,24 @@ def read_bot_state():
         return None, None, "Unable to read PostgreSQL. Check the Streamlit secret, database access, and database status."
 
 
+def closed_trade_frame(closed):
+    """Normalize completed trades; missing P&L is not assumed to be zero."""
+    if not closed:
+        return pd.DataFrame()
+    df = pd.DataFrame(closed)
+    if "pnl_usd" not in df.columns:
+        df["pnl_usd"] = float("nan")
+    df["pnl_usd"] = pd.to_numeric(df["pnl_usd"], errors="coerce")
+    if "symbol" not in df.columns:
+        df["symbol"] = "Unknown"
+    df["symbol"] = df["symbol"].fillna("Unknown").astype(str)
+    if "at" in df.columns:
+        df["closed_at"] = pd.to_datetime(df["at"], errors="coerce", utc=True)
+    else:
+        df["closed_at"] = pd.NaT
+    return df
+
+
 bot_tab, demo_tab = st.tabs(["🤖 Bot results (Render)", "🧪 Separate demo desk"])
 
 with bot_tab:
@@ -41,14 +58,61 @@ with bot_tab:
         closed = state.get("closed", []) or []
         trades = state.get("trades", []) or []
         equity = float(state.get("last_equity", cash))
-        wins = sum(float(item.get("pnl_usd", 0)) > 0 for item in closed)
+        closed_df = closed_trade_frame(closed)
+        valid = closed_df.dropna(subset=["pnl_usd"]) if not closed_df.empty else pd.DataFrame()
+        wins = int((valid["pnl_usd"] > 0).sum()) if not valid.empty else 0
         a, b, c, d = st.columns(4)
         a.metric("Last recorded paper equity", f"${equity:,.2f}")
         b.metric("Paper cash", f"${cash:,.2f}")
         c.metric("Open positions", len(positions))
         d.metric("Closed trades", len(closed))
-        st.caption(f"Saved to database: {updated} · Closed-trade win rate: {wins / len(closed) * 100:.1f}%" if closed else f"Saved to database: {updated} · No closed trades yet")
+        if not valid.empty:
+            st.caption(f"Saved to database: {updated} · Closed-trade win rate: {wins / len(valid) * 100:.1f}% (of {len(valid)} trades with recorded P&L)")
+        else:
+            st.caption(f"Saved to database: {updated} · No completed trades with recorded P&L yet")
         st.info("Equity is the bot's last recorded estimate, not a live quote. Prices, fills, and returns are simulated.")
+
+        st.subheader("📈 Performance overview")
+        if valid.empty:
+            st.write("Performance statistics will appear when completed trades with P&L are recorded.")
+        else:
+            net_pnl = float(valid["pnl_usd"].sum())
+            losses = int((valid["pnl_usd"] < 0).sum())
+            breakeven = int((valid["pnl_usd"] == 0).sum())
+            avg_pnl = float(valid["pnl_usd"].mean())
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Realized simulated P&L", f"${net_pnl:+,.2f}")
+            p2.metric("Win rate", f"{wins / len(valid) * 100:.1f}%")
+            p3.metric("Winning / losing", f"{wins} / {losses}")
+            p4.metric("Average P&L per close", f"${avg_pnl:+,.2f}")
+            st.caption(f"Based on {len(valid)} completed trades with numeric P&L; {breakeven} break-even. Excludes open-position gains/losses, fees not recorded by the bot, and any missing P&L values.")
+
+            # Preserve the stored order when timestamps are absent or duplicated.
+            ordered = valid.copy()
+            ordered["record_order"] = range(len(ordered))
+            ordered = ordered.sort_values(["closed_at", "record_order"], na_position="last", kind="stable")
+            ordered["Cumulative realized P&L (USD)"] = ordered["pnl_usd"].cumsum()
+            ordered["Completed trade"] = range(1, len(ordered) + 1)
+            st.subheader("Cumulative realized simulated P&L")
+            st.line_chart(ordered.set_index("Completed trade")[["Cumulative realized P&L (USD)"]])
+
+            st.subheader("Performance by token")
+            by_token = (valid.groupby("symbol", dropna=False)
+                        .agg(trades=("pnl_usd", "size"), net_pnl_usd=("pnl_usd", "sum"),
+                             wins=("pnl_usd", lambda x: int((x > 0).sum())))
+                        .reset_index())
+            by_token["win_rate_pct"] = (100 * by_token["wins"] / by_token["trades"]).round(1)
+            by_token = by_token.sort_values("net_pnl_usd", ascending=False)
+            st.dataframe(by_token.rename(columns={"symbol": "Token", "trades": "Closed trades",
+                                                       "net_pnl_usd": "Net P&L (USD)", "wins": "Wins",
+                                                       "win_rate_pct": "Win rate (%)"}),
+                         use_container_width=True, hide_index=True)
+            best = valid.loc[valid["pnl_usd"].idxmax()]
+            worst = valid.loc[valid["pnl_usd"].idxmin()]
+            t1, t2 = st.columns(2)
+            t1.metric("Best completed trade", f"{best['symbol']}: ${best['pnl_usd']:+,.2f}")
+            t2.metric("Worst completed trade", f"{worst['symbol']}: ${worst['pnl_usd']:+,.2f}")
+
         st.subheader("Open simulated positions")
         if positions:
             rows = [{"address": addr, **pos} for addr, pos in positions.items()]
